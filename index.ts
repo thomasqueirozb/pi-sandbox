@@ -491,12 +491,13 @@ export default function (pi: ExtensionAPI) {
   interface PromptOption {
     label: string;
     key: string;
-    action: "abort" | "session" | "project" | "global";
+    action: "abort" | "once" | "session" | "project" | "global";
     confirm?: boolean;
     hint?: string;
   }
 
   const PERMISSION_OPTIONS: PromptOption[] = [
+    { label: "Allow this time only", key: "1", action: "once" },
     { label: "Allow for this session only", key: "s", action: "session" },
     { label: "Abort (keep blocked)", key: "esc", action: "abort" },
     {
@@ -519,15 +520,15 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     title: string,
     options: PromptOption[],
-  ): Promise<"abort" | "session" | "project" | "global"> {
+  ): Promise<"abort" | "once" | "session" | "project" | "global"> {
     if (!ctx.hasUI) return "abort";
 
-    const result = await ctx.ui.custom<"abort" | "session" | "project" | "global">(
+    const result = await ctx.ui.custom<"abort" | "once" | "session" | "project" | "global">(
       (tui, theme, _kb, done) => {
         let selectedIndex = 0;
-        let pendingAction: "abort" | "session" | "project" | "global" | null = null;
+        let pendingAction: "abort" | "once" | "session" | "project" | "global" | null = null;
 
-        function resolve(action: "abort" | "session" | "project" | "global") {
+        function resolve(action: "abort" | "once" | "session" | "project" | "global") {
           done(action);
         }
 
@@ -629,7 +630,7 @@ export default function (pi: ExtensionAPI) {
   async function promptDomainBlock(
     ctx: ExtensionContext,
     domain: string,
-  ): Promise<"abort" | "session" | "project" | "global"> {
+  ): Promise<"abort" | "once" | "session" | "project" | "global"> {
     return showPermissionPrompt(
       ctx,
       `🌐 Network blocked: "${domain}" is not in allowedDomains`,
@@ -640,7 +641,7 @@ export default function (pi: ExtensionAPI) {
   async function promptReadBlock(
     ctx: ExtensionContext,
     filePath: string,
-  ): Promise<"abort" | "session" | "project" | "global"> {
+  ): Promise<"abort" | "once" | "session" | "project" | "global"> {
     return showPermissionPrompt(
       ctx,
       `📖 Read blocked: "${filePath}" is not in allowRead`,
@@ -651,7 +652,7 @@ export default function (pi: ExtensionAPI) {
   async function promptWriteBlock(
     ctx: ExtensionContext,
     filePath: string,
-  ): Promise<"abort" | "session" | "project" | "global"> {
+  ): Promise<"abort" | "once" | "session" | "project" | "global"> {
     return showPermissionPrompt(
       ctx,
       `📝 Write blocked: "${filePath}" is not in allowWrite`,
@@ -752,7 +753,9 @@ export default function (pi: ExtensionAPI) {
         if (blockedPath) {
           const choice = await promptWriteBlock(ctx, blockedPath);
           if (choice !== "abort") {
-            await applyWriteChoice(choice, blockedPath, ctx.cwd);
+            if (choice !== "once") {
+              await applyWriteChoice(choice, blockedPath, ctx.cwd);
+            }
 
             // Check if denyWrite would still block it even after allowing.
             const config = loadConfig(ctx.cwd);
@@ -805,7 +808,9 @@ export default function (pi: ExtensionAPI) {
             },
           };
         }
-        await applyDomainChoice(choice, domain, ctx.cwd);
+        if (choice !== "once") {
+          await applyDomainChoice(choice, domain, ctx.cwd);
+        }
       }
     }
 
@@ -835,7 +840,9 @@ export default function (pi: ExtensionAPI) {
               reason: `Network access to "${domain}" is blocked (not in allowedDomains).`,
             };
           }
-          await applyDomainChoice(choice, domain, ctx.cwd);
+          if (choice !== "once") {
+            await applyDomainChoice(choice, domain, ctx.cwd);
+          }
         }
       }
     }
@@ -858,7 +865,9 @@ export default function (pi: ExtensionAPI) {
             reason: `Sandbox: read access denied for "${filePath}"`,
           };
         }
-        await applyReadChoice(choice, filePath, ctx.cwd);
+        if (choice !== "once") {
+          await applyReadChoice(choice, filePath, ctx.cwd);
+        }
         // Allowed — fall through, tool runs.
         return;
       }
@@ -888,7 +897,9 @@ export default function (pi: ExtensionAPI) {
             reason: `Sandbox: write access denied for "${path}" (not in allowWrite)`,
           };
         }
-        await applyWriteChoice(choice, path, ctx.cwd);
+        if (choice !== "once") {
+          await applyWriteChoice(choice, path, ctx.cwd);
+        }
         // Allowed — fall through, tool runs.
         return;
       }
