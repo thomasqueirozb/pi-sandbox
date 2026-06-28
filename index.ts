@@ -88,6 +88,7 @@ import { matchesKey, Key, truncateToWidth } from "@earendil-works/pi-tui";
 
 interface SandboxConfig extends SandboxRuntimeConfig {
   enabled?: boolean;
+  allowUnsafeCommands?: string[];
 }
 
 const DEFAULT_CONFIG: SandboxConfig = {
@@ -156,11 +157,13 @@ function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): Sand
     ignoreViolations?: Record<string, string[]>;
     enableWeakerNestedSandbox?: boolean;
     allowBrowserProcess?: boolean;
+    allowUnsafeCommands?: string[];
   };
   const extResult = result as {
     ignoreViolations?: Record<string, string[]>;
     enableWeakerNestedSandbox?: boolean;
     allowBrowserProcess?: boolean;
+    allowUnsafeCommands?: string[];
   };
 
   if (extOverrides.ignoreViolations) {
@@ -171,6 +174,12 @@ function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): Sand
   }
   if (extOverrides.allowBrowserProcess !== undefined) {
     extResult.allowBrowserProcess = extOverrides.allowBrowserProcess;
+  }
+  if (extOverrides.allowUnsafeCommands !== undefined) {
+    extResult.allowUnsafeCommands = [
+      ...(extResult.allowUnsafeCommands ?? []),
+      ...extOverrides.allowUnsafeCommands,
+    ];
   }
 
   return result;
@@ -339,6 +348,15 @@ function addWritePathToConfig(configPath: string, pathToAdd: string): void {
   }
 }
 
+function addUnsafeCommandToConfig(configPath: string, command: string): void {
+  const config = readOrEmptyConfig(configPath);
+  const existing = config.allowUnsafeCommands ?? [];
+  if (!existing.includes(command)) {
+    config.allowUnsafeCommands = [...existing, command];
+    writeConfigFile(configPath, config);
+  }
+}
+
 // ── Sandboxed bash ops ────────────────────────────────────────────────────────
 
 function createSandboxedBashOps(shellPath?: string): BashOperations {
@@ -436,7 +454,7 @@ export default function (pi: ExtensionAPI) {
   const sessionAllowedDomains: string[] = [];
   const sessionAllowedReadPaths: string[] = [];
   const sessionAllowedWritePaths: string[] = [];
-
+  const sessionAllowedUnsafeCommands: string[] = [];
   // ── Effective config helpers ────────────────────────────────────────────────
 
   function getEffectiveAllowedDomains(cwd: string): string[] {
@@ -500,6 +518,26 @@ export default function (pi: ExtensionAPI) {
   }
 
   const PERMISSION_OPTIONS: PromptOption[] = [
+    { label: "Allow this time only", key: "1", action: "once" },
+    { label: "Allow for this session only", key: "s", action: "session" },
+    { label: "Abort (keep blocked)", key: "esc", action: "abort" },
+    {
+      label: "Allow for this project",
+      key: "P",
+      action: "project",
+      confirm: true,
+      hint: "→ .pi/sandbox.json",
+    },
+    {
+      label: "Allow for all projects",
+      key: "A",
+      action: "global",
+      confirm: true,
+      hint: "→ ~/.pi/agent/sandbox.json",
+    },
+  ];
+
+  const UNSAFE_BASH_OPTIONS: PromptOption[] = [
     { label: "Allow this time only", key: "1", action: "once" },
     { label: "Allow for this session only", key: "s", action: "session" },
     { label: "Abort (keep blocked)", key: "esc", action: "abort" },
@@ -710,14 +748,86 @@ export default function (pi: ExtensionAPI) {
     await reinitializeSandbox(cwd);
   }
 
+  async function applyUnsafeBashCommandChoice(
+    choice: "session" | "project" | "global",
+    command: string,
+    cwd: string,
+  ): Promise<void> {
+    if (!sessionAllowedUnsafeCommands.includes(command)) sessionAllowedUnsafeCommands.push(command);
+    if (choice === "project") {
+      const { projectPath } = getConfigPaths(cwd);
+      addUnsafeCommandToConfig(projectPath, command);
+    }
+    if (choice === "global") {
+      const { globalPath } = getConfigPaths(cwd);
+      addUnsafeCommandToConfig(globalPath, command);
+    }
+  }
+
   // ── Bash tool — with write-block detection and retry ───────────────────────
 
   pi.registerTool({
     ...localBash,
     label: "bash (sandboxed)",
+    promptGuidelines: [
+      'Prefix a command with "!! " (double bang + space) to bypass the sandbox.',
+      'Use "!! " when the command needs access denied by the sandbox (e.g., unrestricted network access, accessing restricted paths within bash such as system files).',
+      'Each "!! " command requires user approval, use only when necessary.',
+    ],
     async execute(id, params, signal, onUpdate, ctx) {
+      // Check for "!! " prefix to request sandbox bypass.
+      const command = params.command;
+      const bypassRequested = command.startsWith("!! ");
+
+      if (bypassRequested) {
+        const strippedCommand = command.slice(3);
+        const config = ctx ? loadConfig(ctx.cwd) : DEFAULT_CONFIG;
+        const approvedCommands = [
+          ...(config.allowUnsafeCommands ?? []),
+          ...sessionAllowedUnsafeCommands,
+        ];
+
+        if (!approvedCommands.includes(strippedCommand)) {
+          if (ctx?.hasUI) {
+            const snippet = command.length > 80 ? command.slice(0, 77) + "..." : command;
+            const choice = await showPermissionPrompt(
+              ctx,
+              `🔓💥 Unsandboxed bash: "${snippet}"`,
+              UNSAFE_BASH_OPTIONS,
+            );
+            if (choice === "abort") {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Sandbox: unsandboxed bash blocked by user. Remove the "!! " prefix to run sandboxed.`,
+                  },
+                ],
+                details: {},
+              };
+            }
+            if (choice !== "once") {
+              await applyUnsafeBashCommandChoice(choice, strippedCommand, ctx.cwd);
+            }
+          } else {
+            // No UI available — block the bypass to prevent silent unsandboxed execution.
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Sandbox: "!! " prefix requires interactive approval. Remove the prefix to run sandboxed.`,
+                },
+              ],
+              details: {},
+            };
+          }
+        }
+
+        params.command = strippedCommand;
+      }
+
       const runBash = () => {
-        if (!sandboxEnabled || !sandboxInitialized) {
+        if (bypassRequested || !sandboxEnabled || !sandboxInitialized) {
           return localBash.execute(id, params, signal, onUpdate, ctx);
         }
         const sandboxedBash = createBashToolDefinition(localCwd, {
@@ -1117,6 +1227,12 @@ export default function (pi: ExtensionAPI) {
           : []),
         ...(sessionAllowedWritePaths.length > 0
           ? [`  Session write: ${sessionAllowedWritePaths.join(", ")}`]
+          : []),
+        "",
+        'Unsafe bash ("!! " prefix):',
+        `  Config allowed: ${config.allowUnsafeCommands?.join(", ") || "(none)"}`,
+        ...(sessionAllowedUnsafeCommands.length > 0
+          ? [`  Session allowed: ${sessionAllowedUnsafeCommands.join(", ")}`]
           : []),
         "",
         "Note: ALL reads are prompted unless the path is already in allowRead.",
